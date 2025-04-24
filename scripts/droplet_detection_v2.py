@@ -1,0 +1,412 @@
+# Water-in-Oil Droplet Detection Script
+
+import os
+import numpy as np
+import pandas as pd
+from skimage import io, filters, measure, morphology
+from pathlib import Path
+import napari
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+
+
+class DropletDetector:
+    """Detect water-in-oil droplets and analyze their properties."""
+
+    def __init__(self, min_diameter=10, max_diameter=500, min_circularity=0.8):
+        """
+        Initialize the droplet detector with thresholds.
+
+        Parameters:
+        -----------
+        min_diameter : float
+            Minimum diameter of droplets to detect (in pixels)
+        max_diameter : float
+            Maximum diameter of droplets to detect (in pixels)
+        min_circularity : float
+            Minimum circularity threshold (0-1 range, where 1 is a perfect circle)
+        """
+        self.min_diameter = min_diameter
+        self.max_diameter = max_diameter
+        self.min_circularity = min_circularity
+        self.viewer = None
+        print(f"Initialized DropletDetector with:\n"
+              f"  • Min diameter: {min_diameter} pixels\n"
+              f"  • Max diameter: {max_diameter} pixels\n"
+              f"  • Min circularity: {min_circularity:.2f}")
+
+    def process_directory(self, input_dir, output_csv, show_viewer=False):
+        """
+        Process all images in a directory and save results to CSV.
+
+        Parameters:
+        -----------
+        input_dir : str
+            Path to directory containing images
+        output_csv : str
+            Path to save the results CSV
+        show_viewer : bool
+            Whether to show napari viewer during processing
+        """
+        input_path = Path(input_dir)
+        image_extensions = ['.png', '.jpg', '.jpeg', '.tif', '.tiff']
+        image_files = [f for f in input_path.iterdir()
+                      if f.suffix.lower() in image_extensions]
+
+        if not image_files:
+            print(f"No image files found in {input_dir}")
+            return
+
+        all_results = []
+        image_collection = []
+
+        # Initialize viewer at the beginning if needed
+        if show_viewer:
+            self.viewer = napari.Viewer()
+
+        for img_file in tqdm(image_files, desc="Processing images"):
+            try:
+                image = io.imread(img_file)
+                if len(image.shape) > 2 and image.shape[2] > 1:
+                    # Convert RGB to grayscale if needed
+                    image = np.mean(image[:,:,:3], axis=2).astype(np.uint8)
+
+                # Process the image without showing in viewer yet
+                results = self.process_image(image, img_file.name, False)
+                all_results.extend(results)
+
+                # Store image and its results for later visualization
+                if show_viewer:
+                    processed_data = self._prepare_visualization(image, results)
+                    image_collection.append({
+                        'name': img_file.name,
+                        'image': image,
+                        'binary_mask': processed_data['binary_mask'],
+                        'droplets': processed_data['droplets'],
+                        'properties': processed_data['properties']
+                    })
+
+            except Exception as e:
+                print(f"Error processing {img_file}: {e}")
+
+        # Save results to CSV
+        df = pd.DataFrame(all_results)
+        os.makedirs(os.path.dirname(os.path.abspath(output_csv)), exist_ok=True)
+        df.to_csv(output_csv, index=False)
+        print(f"Results saved to {output_csv}")
+
+        # Display all images in the viewer if requested
+        if show_viewer and self.viewer is not None and image_collection:
+            self._display_image_collection(image_collection)
+            napari.run()
+
+    def process_image(self, image, image_name="", show_viewer=False):
+        """
+        Process a single image to detect droplets.
+
+        Parameters:
+        -----------
+        image : ndarray
+            Input image as numpy array
+        image_name : str
+            Name of the image file for reference
+        show_viewer : bool
+            Whether to display the image in napari viewer
+
+        Returns:
+        --------
+        list of dicts
+            List of dictionaries containing properties of detected droplets
+        """
+        # Pre-process image
+        # Apply Gaussian blur to reduce noise
+        smoothed = filters.gaussian(image, sigma=1.0)
+
+        # Threshold the image using Otsu's method
+        threshold_value = filters.threshold_otsu(smoothed)
+        binary = smoothed > threshold_value
+
+        # Clean up binary image
+        # Remove small objects
+        min_size = int(np.pi * (self.min_diameter/2)**2 * 0.5)  # Minimum area in pixels
+        cleaned = morphology.remove_small_objects(binary, min_size=min_size)
+
+        # Fill holes in the binary image
+        filled = morphology.remove_small_holes(cleaned)
+
+        # Label connected components
+        labeled_mask, num_labels = measure.label(filled, return_num=True)
+
+        # Measure properties of the detected regions
+        props = measure.regionprops(labeled_mask, image)
+
+        # Filter regions based on circularity and diameter
+        results = []
+
+        for region in props:
+            # Calculate perimeter and area
+            perimeter = region.perimeter
+            area = region.area
+
+            # Calculate circularity: 4*pi*area/(perimeter^2)
+            # A perfect circle has circularity of 1
+            if perimeter > 0:
+                circularity = 4 * np.pi * area / (perimeter * perimeter)
+            else:
+                circularity = 0
+
+            # Calculate diameter
+            diameter = region.equivalent_diameter
+
+            # Check if the droplet meets our criteria
+            if (circularity >= self.min_circularity and
+                diameter >= self.min_diameter and
+                diameter <= self.max_diameter):
+
+                result = {
+                    'image_name': image_name,
+                    'droplet_id': region.label,
+                    'diameter': diameter,
+                    'circularity': circularity,
+                    'area': area,
+                    'centroid_y': region.centroid[0],
+                    'centroid_x': region.centroid[1]
+                }
+                results.append(result)
+
+        return results
+
+    def _prepare_visualization(self, image, results):
+        """
+        Prepare visualization data for an image.
+
+        Parameters:
+        -----------
+        image : ndarray
+            Original image
+        results : list
+            List of droplet detection results
+
+        Returns:
+        --------
+        dict
+            Dictionary with visualization data
+        """
+        # Process image again to get binary mask
+        smoothed = filters.gaussian(image, sigma=1.0)
+        threshold_value = filters.threshold_otsu(smoothed)
+        binary = smoothed > threshold_value
+        min_size = int(np.pi * (self.min_diameter/2)**2 * 0.5)
+        cleaned = morphology.remove_small_objects(binary, min_size=min_size)
+        filled = morphology.remove_small_holes(cleaned)
+
+        # Create circles for detected droplets
+        shapes_data = []
+        shape_properties = {'diameter': [], 'circularity': []}
+
+        for result in results:
+            # Create circle at centroid with appropriate radius
+            y, x = result['centroid_y'], result['centroid_x']
+            radius = result['diameter'] / 2
+
+            # Create circle points
+            theta = np.linspace(0, 2*np.pi, 100)
+            circle_x = x + radius * np.cos(theta)
+            circle_y = y + radius * np.sin(theta)
+            circle_points = np.column_stack([circle_y, circle_x])
+
+            shapes_data.append(circle_points)
+            shape_properties['diameter'].append(result['diameter'])
+            shape_properties['circularity'].append(result['circularity'])
+
+        return {
+            'binary_mask': filled,
+            'droplets': shapes_data,
+            'properties': shape_properties
+        }
+
+    def _display_image_collection(self, image_collection):
+        """
+        Display a collection of images in the napari viewer.
+
+        Parameters:
+        -----------
+        image_collection : list
+            List of dictionaries with image data
+        """
+        if not self.viewer:
+            self.viewer = napari.Viewer()
+
+        # Clear existing layers
+        self.viewer.layers.clear()
+
+        # Create a grid of images
+        rows = int(np.ceil(np.sqrt(len(image_collection))))
+        cols = int(np.ceil(len(image_collection) / rows))
+
+        for i, item in enumerate(image_collection):
+            # Calculate grid position
+            row = i // cols
+            col = i % cols
+
+            # Add image to viewer with offset
+            offset = [row * image_collection[0]['image'].shape[0],
+                      col * image_collection[0]['image'].shape[1]]
+
+            # Add original image
+            self.viewer.add_image(
+                item['image'],
+                name=f"Original_{item['name']}",
+                translate=offset
+            )
+
+            # Add binary mask
+            self.viewer.add_image(
+                item['binary_mask'],
+                name=f"Mask_{item['name']}",
+                opacity=0.5,
+                translate=offset
+            )
+
+            # Add shape layers for droplets
+            if item['droplets']:
+                # Offset each droplet shape
+                offset_shapes = []
+                for shape in item['droplets']:
+                    offset_shape = shape.copy()
+                    offset_shape[:, 0] += offset[0]
+                    offset_shape[:, 1] += offset[1]
+                    offset_shapes.append(offset_shape)
+
+                self.viewer.add_shapes(
+                    offset_shapes,
+                    shape_type='polygon',
+                    edge_color='red',
+                    face_color='transparent',
+                    name=f"Droplets_{item['name']}",
+                    properties=item['properties']
+                )
+
+        # Reset view to fit all images
+        self.viewer.reset_view()
+
+    def analyze_results(self, csv_path, output_dir=None):
+        """
+        Analyze droplet detection results and generate visualizations.
+
+        Parameters:
+        -----------
+        csv_path : str
+            Path to the CSV file with droplet data
+        output_dir : str, optional
+            Directory to save visualization files
+        """
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+
+        # Load the CSV data with explicit path handling
+        csv_path = os.path.abspath(csv_path)
+        if not os.path.exists(csv_path):
+            print(f"Error: CSV file not found at {csv_path}")
+            return
+
+        try:
+            df = pd.read_csv(csv_path)
+
+            # Check if required columns exist
+            required_cols = ['image_name', 'diameter', 'circularity']
+            missing_cols = [col for col in required_cols if col not in df.columns]
+            if missing_cols:
+                print(f"Error: Missing columns in CSV: {missing_cols}")
+                return
+
+            # Print summary statistics
+            print(f"Total droplets detected: {len(df)}")
+            print(f"Number of images: {df['image_name'].nunique()}")
+            print(f"Droplets per image: {len(df) / df['image_name'].nunique():.1f}")
+            print(f"Diameter statistics:")
+            print(f"  Min: {df['diameter'].min():.2f}")
+            print(f"  Max: {df['diameter'].max():.2f}")
+            print(f"  Mean: {df['diameter'].mean():.2f}")
+            print(f"  Median: {df['diameter'].median():.2f}")
+
+            # Create histogram of droplet diameters
+            plt.figure(figsize=(10, 6))
+            plt.hist(df['diameter'], bins=30, alpha=0.7, color='blue')
+            plt.xlabel('Droplet Diameter (pixels)')
+            plt.ylabel('Count')
+            plt.title('Distribution of Droplet Diameters')
+            plt.grid(alpha=0.3)
+
+            if output_dir:
+                plt.savefig(os.path.join(output_dir, 'diameter_histogram.png'), dpi=300)
+                plt.close()
+            else:
+                plt.show()
+
+            # Create scatter plot of diameter vs circularity
+            plt.figure(figsize=(10, 6))
+            plt.scatter(df['diameter'], df['circularity'], alpha=0.5)
+            plt.xlabel('Droplet Diameter (pixels)')
+            plt.ylabel('Circularity')
+            plt.title('Droplet Diameter vs Circularity')
+            plt.axhline(y=self.min_circularity, color='r', linestyle='--',
+                       label=f'Min Circularity: {self.min_circularity}')
+            plt.grid(alpha=0.3)
+            plt.legend()
+
+            if output_dir:
+                plt.savefig(os.path.join(output_dir, 'diameter_vs_circularity.png'), dpi=300)
+                plt.close()
+            else:
+                plt.show()
+
+        except Exception as e:
+            print(f"Error analyzing results: {e}")
+
+
+def main():
+    """Main function to run the droplet detection."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description='Detect and analyze water-in-oil droplets')
+    parser.add_argument('--input_dir', type=str, required=True,
+                        help='Directory containing images')
+    parser.add_argument('--output_csv', type=str, required=True,
+                        help='Path to save results CSV')
+    parser.add_argument('--min_diameter', type=float, default=10,
+                        help='Minimum droplet diameter in pixels')
+    parser.add_argument('--max_diameter', type=float, default=500,
+                        help='Maximum droplet diameter in pixels')
+    parser.add_argument('--min_circularity', type=float, default=0.8,
+                        help='Minimum circularity (0-1)')
+    parser.add_argument('--show_viewer', action='store_true',
+                        help='Show napari viewer during processing')
+    parser.add_argument('--analyze', action='store_true',
+                        help='Analyze results after processing')
+    parser.add_argument('--viz_dir', type=str, default=None,
+                        help='Directory to save visualizations')
+
+    args = parser.parse_args()
+
+    # Initialize the detector
+    detector = DropletDetector(
+        min_diameter=args.min_diameter,
+        max_diameter=args.max_diameter,
+        min_circularity=args.min_circularity
+    )
+
+    # Process images
+    detector.process_directory(
+        args.input_dir,
+        args.output_csv,
+        show_viewer=args.show_viewer
+    )
+
+    # Analyze results if requested
+    if args.analyze:
+        detector.analyze_results(args.output_csv, args.viz_dir)
+
+
+if __name__ == "__main__":
+    main()
