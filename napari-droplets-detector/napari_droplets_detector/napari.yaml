@@ -1,0 +1,21 @@
+name: napari-droplets-detector
+display_name: Droplets Detector
+contributions:
+  commands:
+    - id: napari-droplets-detector.detector
+      python_name: napari_droplets_detector._widget:droplets_detector_widget
+      title: Detect Droplets
+    - id: napari-droplets-detector.export_csv
+      python_name: napari_droplets_detector._widget:export_csv_widget
+      title: Export to CSV
+    - id: napari-droplets-detector.analysis
+      python_name: napari_droplets_detector._widget:droplets_analysis_widget
+      title: Analyze Droplets
+  widgets:
+    - command: napari-droplets-detector.detector
+      display_name: Droplets Detector
+    - command: napari-droplets-detector.export_csv
+      display_name: Export to CSV
+    - command: napari-droplets-detector.analysis
+      display_name: Analyze Droplets
+

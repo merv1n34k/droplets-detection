@@ -1,4 +1,4 @@
-# Droplet detection
+# Droplets detection
 
 This is a collection of python scripts and a napari plugin for detecting droplets from microscopy images.
 
