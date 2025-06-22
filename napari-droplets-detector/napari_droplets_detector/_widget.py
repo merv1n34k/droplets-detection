@@ -4,89 +4,227 @@ A napari plugin for interactive detection and analysis of water-in-oil droplets.
 
 import os
 import numpy as np
-from skimage import io, filters, measure, morphology
+from skimage import (
+        filters, measure, morphology, segmentation,
+        color, util, feature
+)
 import napari
-from napari.layers import Image, Shapes
+from napari.layers import Image
 import pandas as pd
+from scipy import ndimage as ndi
 import matplotlib.pyplot as plt
 from magicgui import magic_factory
 from napari.utils.notifications import show_info
+import re
+from pathlib import Path
+import csv
 
-def _droplets_detection_alorythm(image, min_diameter):
-    # Apply Gaussian blur to reduce noise
-    smoothed = filters.gaussian(image, sigma=1.0)
+# HEX conversion and csv import helper tools
 
-    # Threshold the image using Otsu's method
-    threshold_value = filters.threshold_otsu(smoothed)
-    binary = smoothed > threshold_value
+_HEX_RE = re.compile(r"^#?([0-9a-fA-F]{6})$")
 
-    # Clean up binary image
-    # Remove small objects
-    min_size = int(np.pi * (min_diameter/2)**2 * 0.5)
-    cleaned = morphology.remove_small_objects(binary, min_size=min_size)
+def _hex_to_rgb_float(hexstr: str):
+    m = _HEX_RE.match(hexstr)
+    if not m:
+        raise ValueError(f"'{hexstr}' is not a valid #RRGGBB colour")
+    h = m.group(1)
+    return tuple(int(h[i : i + 2], 16) / 255.0 for i in (0, 2, 4))
 
-    # Fill holes in the binary image
-    binary_mask = morphology.remove_small_holes(cleaned)
 
-    # Detect droplets
-    # Label connected components
-    labeled_mask = measure.label(binary_mask, return_num=True)[0]
+def _load_hex_palette(csv_path: Path, *, col=0):
+    """Return a list[str] of #RRGGBB hex colours from *csv_path*."""
+    colours = []
+    try:
+        with csv_path.open(newline="") as fh:
+            reader = csv.reader(fh)
+            for row in reader:
+                if len(row) > col and row[col].strip():
+                    colours.append(row[col].strip())
+    except Exception as e:
+        show_info(f"Could not read palette file: {e}")
+        return []
+    return colours
 
-    # Measure properties of the detected regions
-    props = measure.regionprops(labeled_mask, image)
 
-    return (binary_mask, props)
+def _droplets_detection_alorythm(
+    image,
+    min_diameter,
+    max_diameter,
+    *,
+    min_circularity=0.70     # tweak if your droplets are very irregular
+):
+    """
+    Segment droplets and discard regions that are
+
+    - too small / too large **by area**
+    - or not round enough (circularity < `min_circularity`).
+
+    Returns
+    -------
+    pruned_mask : bool ndarray
+        True only on accepted droplets.
+    props : list[RegionProperties]
+        Region properties for accepted droplets.
+    """
+
+    # Convert image to grayscale if needed
+    gray = color.rgb2gray(image) if image.ndim == 3 else util.img_as_float32(image)
+
+    # Do quick denoise + Otsu threshold
+    smoothed = filters.gaussian(gray, sigma=1.0)
+    mask = smoothed > filters.threshold_otsu(smoothed)
+
+    mask = morphology.binary_closing(mask, morphology.disk(1))
+    base_area = np.pi * (min_diameter / 2) ** 2
+    mask = morphology.remove_small_objects(mask, min_size=int(base_area * 0.2))
+    mask = morphology.remove_small_holes(mask, area_threshold=int(base_area * 0.2))
+
+    # Do watershed split
+    dist = ndi.distance_transform_edt(mask)
+    coords = feature.peak_local_max(
+        dist,
+        min_distance=max(1, int(min_diameter * 0.05)),
+        labels=mask
+    )
+    markers = np.zeros_like(dist, dtype=np.int32)
+    markers[tuple(coords.T)] = np.arange(1, coords.shape[0] + 1)
+    labels = segmentation.watershed(-dist, markers, mask=mask)
+
+    # Prune unwanted regions based on area & circularity
+    area_min_ref = np.pi * (min_diameter / 2) ** 2
+    area_max_ref = np.pi * (max_diameter / 2) ** 2
+    area_lo = area_min_ref / (1.5 ** 2)      # 2/3 of min_diameter
+    area_hi = area_max_ref * (1.5 ** 2)      # 1.5 of max_diameter
+
+    keep = np.zeros(labels.max() + 1, dtype=bool)
+
+    props_all = measure.regionprops(labels, intensity_image=gray)
+    for rp in props_all:
+        A = rp.area
+        P = rp.perimeter or 1           # avoid /0
+        circ = 4 * np.pi * A / (P * P)  # circularity
+
+        if (area_lo <= A <= area_hi) and (circ >= min_circularity):
+            keep[rp.label] = True
+
+    pruned_mask = keep[labels]
+    labels_pruned = measure.label(pruned_mask, connectivity=2)
+    props = measure.regionprops(labels_pruned, intensity_image=gray)
+
+    return pruned_mask, props
 
 @magic_factory(
-    call_button="Process Image",
+    call_button="Process / Refresh Image",
     layout="vertical",
-    min_diameter={"widget_type": "FloatSpinBox", "min": 1.0, "max": 1000.0, "step": 1.0, "value": 60.0, "label": "Min Diameter (px)"},
-    max_diameter={"widget_type": "FloatSpinBox", "min": 1.0, "max": 5000.0, "step": 10.0, "value": 200.0, "label": "Max Diameter (px)"},
-    min_circularity={"widget_type": "FloatSpinBox", "min": 0.0, "max": 1.0, "step": 0.05, "value": 0.5, "label": "Min Circularity"},
-    min_border_dist={"widget_type": "FloatSpinBox", "min": 0.0, "max": 1000.0, "step": 10.0, "value": 50.0, "label": "Border Distance (px)"},
-    conversion_factor={"widget_type": "FloatSpinBox", "min": 0.01, "max": 100.0, "step": 0.0001, "value": 1.0, "label": "Conversion Factor (px to μm)"},
+    palette_csv=dict(
+        widget_type="FileEdit",
+        mode="r",
+        filter="CSV (*.csv)",
+        label="Palette CSV (optional)"
+    ),
+    min_diameter=dict(widget_type="FloatSpinBox", min=1.0,  max=1000.0, step=1.0,  value=60.0,  label="Min Diameter (px)"),
+    max_diameter=dict(widget_type="FloatSpinBox", min=1.0,  max=5000.0, step=10.0, value=200.0, label="Max Diameter (px)"),
+    min_circularity=dict(widget_type="FloatSpinBox", min=0.0, max=1.0,    step=0.05, value=0.5,  label="Min Circularity"),
+    min_border_dist=dict(widget_type="FloatSpinBox", min=0.0, max=1000.0, step=10.0, value=50.0,  label="Border Dist. (px)"),
+    conversion_factor=dict(widget_type="FloatSpinBox", min=0.01, max=100.0, step=0.0001, value=1.0, label="px → μm"),
 )
-def droplets_detector_widget(
-    viewer: napari.Viewer,
+def droplets_detector_widget(                              # noqa: C901
+    viewer: "napari.Viewer",
     image_layer: Image,
     min_diameter: float,
     max_diameter: float,
     min_circularity: float,
     min_border_dist: float,
     conversion_factor: float,
+    palette_csv: Path | None = None,
 ) -> None:
-    """
-    Detect and analyze water-in-oil droplets in images.
-    """
+    """Detect droplets and tint them with a palette CSV chosen by the user."""
+
+    # Check image
     if image_layer is None:
         show_info("Please select an image layer")
         return
-
-    # Get image data
     image = image_layer.data
 
-    # Convert RGB to grayscale if needed
-    if len(image.shape) > 2 and image.shape[2] > 1:
-        image = np.mean(image[:,:,:3], axis=2).astype(np.uint8)
+    # Palette prep
+    if palette_csv and palette_csv.exists():
+        hex_palette = _load_hex_palette(palette_csv)
+    else:
+        hex_palette = []
 
-    processed_image = _droplets_detection_alorythm(image, min_diameter)
+    # validate / convert
+    try:
+        rgb_palette = np.array(
+            [_hex_to_rgb_float(c) for c in hex_palette],
+            dtype=np.float32,
+        )
+    except ValueError as e:
+        show_info(str(e))
+        return
 
-    # Add or update binary mask layer
-    if "Binary Mask" in viewer.layers:
-        viewer.layers["Binary Mask"].data = processed_image[0]
+    # Caching heavy compute data
+    layer_name = "Binary Mask"
+    compute = True
+    props = labels = None
+
+    if layer_name in viewer.layers:
+        lyr = viewer.layers[layer_name]
+        meta = lyr.metadata
+        if (
+            meta.get("min_diameter") == min_diameter
+            and meta.get("max_diameter") == max_diameter
+            and meta.get("min_circularity") == min_circularity):
+            labels = meta.get("labels")
+            props = meta.get("props")
+            compute = labels is None
+
+    # Do segmentation if not cached
+    if compute:
+        bin_mask, props = _droplets_detection_alorythm(
+            image,
+            min_diameter,
+            max_diameter,
+            min_circularity=min_circularity,
+        )
+        labels = measure.label(bin_mask, connectivity=2)
+
+    # Apply colouring for droplets
+    n_labels = int(labels.max())
+    colour_lut = np.zeros((n_labels + 1, 3), dtype=np.float32)  # 0 = black
+    if rgb_palette.size:
+        # repeat palette cyclically if too short
+        reps = int(np.ceil(n_labels / len(rgb_palette)))
+        colour_lut[1:] = np.tile(rgb_palette, (reps, 1))[:n_labels]
+    else:  # fallback deterministic-random
+        rng = np.random.default_rng(42)
+        colour_lut[1:] = rng.random((n_labels, 3), dtype=np.float32)
+
+    rgb_mask = colour_lut[labels]
+
+    # Add metadata to napari
+    metadata = dict(
+        min_diameter=min_diameter,
+        max_diameter=max_diameter,
+        min_circularity=min_circularity,
+        props=props,
+        labels=labels,
+    )
+
+    if layer_name in viewer.layers:
+        viewer.layers[layer_name].data = rgb_mask
+        viewer.layers[layer_name].metadata.update(metadata)
     else:
         viewer.add_image(
-            processed_image[0],
-            name="Binary Mask",
-            opacity=0.5,
-            colormap="red"
-        )
-
-    # Filter regions based on criteria
+            rgb_mask,
+            name=layer_name,
+            rgb=True,
+            opacity=0.9,
+            metadata=metadata,
+        )    # Filter regions based on criteria
     results = []
     shapes_data = []
 
-    for region in processed_image[1]:
+    for region in props:
         # Calculate perimeter and area
         perimeter = region.perimeter
         area = region.area

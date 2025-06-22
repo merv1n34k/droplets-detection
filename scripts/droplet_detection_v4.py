@@ -4,8 +4,8 @@ import os
 import numpy as np
 import pandas as pd
 from skimage import (
-        io, filters, measure, morphology, exposure,
-        segmentation, restoration, color
+        io, filters, measure, morphology,
+        segmentation, feature, util, color
 )
 from pathlib import Path
 import napari
@@ -146,70 +146,58 @@ class DropletDetector:
             Raw image (already loaded via skimage.io.imread or similar).
         image_name : str
             Optional label passed through to each result dict.
+
+        Returns
+        -------
+        pruned_mask : bool ndarray
+            True only on accepted droplets.
+        props : list[RegionProperties]
+            Region properties for accepted droplets.
         """
 
-        # ------------------------------------------------------------------
-        # STEP 0 – prepare a single-channel image in [0,1] for the pipeline
-        # ------------------------------------------------------------------
-        if image.ndim == 3:
-            gray = color.rgb2gray(image)           # converts & scales to float
-        else:
-            gray = image.astype(float)
-            if gray.max() > 1.0:                   # scale if 8-bit / 16-bit
-                gray /= gray.max()
+        # Convert image to grayscale if needed
+        gray = color.rgb2gray(image) if image.ndim == 3 else util.img_as_float32(image)
 
-        # ------------------------------------------------------------------
-        # STEP 1 – boost local contrast (CLAHE)
-        # clip_limit tuned to keep noise low; feel free to expose as argument
-        # ------------------------------------------------------------------
-        gray_eq = exposure.equalize_adapthist(gray, clip_limit=0.03)
+        # Do quick denoise + Otsu threshold
+        smoothed = filters.gaussian(gray, sigma=1.0)
+        mask = smoothed > filters.threshold_otsu(smoothed)
 
-        # ------------------------------------------------------------------
-        # STEP 2 – denoise while keeping edges (bilateral)
-        # ------------------------------------------------------------------
-        gray_smooth = restoration.denoise_bilateral(
-            gray_eq,
-            sigma_color=0.05,      # colour variance
-            sigma_spatial=3,       # spatial radius in px
-            channel_axis=None      # skimage>=0.22
+        mask = morphology.binary_closing(mask, morphology.disk(1))
+        base_area = np.pi * (self.min_diameter / 2) ** 2
+        mask = morphology.remove_small_objects(mask, min_size=int(base_area * 0.2))
+        mask = morphology.remove_small_holes(mask, area_threshold=int(base_area * 0.2))
+
+        # Do watershed split
+        dist = ndi.distance_transform_edt(mask)
+        coords = feature.peak_local_max(
+            dist,
+            min_distance=max(1, int(self.min_diameter * 0.05)),
+            labels=mask
         )
+        markers = np.zeros_like(dist, dtype=np.int32)
+        markers[tuple(coords.T)] = np.arange(1, coords.shape[0] + 1)
+        labels = segmentation.watershed(-dist, markers, mask=mask)
 
-        # ------------------------------------------------------------------
-        # STEP 3 – adaptive threshold (Sauvola)
-        # window size ~¾ of the minimum droplet diameter so that each window
-        # “sees” mostly background + a bit of droplet.
-        # ------------------------------------------------------------------
-        block_size = max(15, int(self.min_diameter * 0.75))
-        local_thresh = filters.threshold_sauvola(gray_smooth, window_size=block_size)
-        binary = gray_smooth > local_thresh
+        # Prune unwanted regions based on area & circularity
+        area_min_ref = np.pi * (self.min_diameter / 2) ** 2
+        area_max_ref = np.pi * (self.max_diameter / 2) ** 2
+        area_lo = area_min_ref / (1.5 ** 2)      # 2/3 of min_diameter
+        area_hi = area_max_ref * (1.5 ** 2)      # 1.5 of max_diameter
 
-        # ------------------------------------------------------------------
-        # STEP 4 – close small gaps along edges
-        # disk radius ≈ min_diameter / 4 – tweak if over/under closing
-        # ------------------------------------------------------------------
-        selem = morphology.disk(max(1, int(self.min_diameter / 4)))
-        binary_closed = morphology.binary_closing(binary, selem)
+        keep = np.zeros(labels.max() + 1, dtype=bool)
 
-        # ------------------------------------------------------------------
-        # STEP 5 – remove tiny specks and fill holes
-        # ------------------------------------------------------------------
-        min_size = int(np.pi * (self.min_diameter/2)**2 * 0.5)
-        cleaned = morphology.remove_small_objects(binary_closed, min_size=min_size)
-        filled = morphology.remove_small_holes(cleaned, area_threshold=min_size)
+        props_all = measure.regionprops(labels, intensity_image=gray)
+        for rp in props_all:
+            A = rp.area
+            P = rp.perimeter or 1           # avoid /0
+            circ = 4 * np.pi * A / (P * P)  # circularity
 
-        # ------------------------------------------------------------------
-        # STEP 6 – optional watershed split (helps if droplets touch)
-        # comment out this block if you *never* have merged droplets
-        # ------------------------------------------------------------------
-        distance = ndi.distance_transform_edt(filled)
-        # peaks where distance is at least 50 % of the local max
-        markers = measure.label(distance > 0.5 * distance.max())
-        labeled_mask = segmentation.watershed(-distance, markers, mask=filled)
+            if (area_lo <= A <= area_hi) and (circ >= self.min_circularity):
+                keep[rp.label] = True
 
-        # ------------------------------------------------------------------
-        # Measure & filter exactly as before
-        # ------------------------------------------------------------------
-        props = measure.regionprops(labeled_mask, intensity_image=gray)
+        pruned_mask = keep[labels]
+        labels_pruned = measure.label(pruned_mask, connectivity=2)
+        props = measure.regionprops(labels_pruned, intensity_image=gray)
 
         # Make sure conversion factor is numeric
         conversion_factor = self.conversion_factor if isinstance(
@@ -246,7 +234,7 @@ class DropletDetector:
                 })
 
         # Return API-compatible outputs
-        binary_mask = filled          # for napari overlay etc.
+        binary_mask = pruned_mask          # for napari overlay etc.
         return results, binary_mask
 
     def _prepare_visualization(self, results):

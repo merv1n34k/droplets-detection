@@ -1,6 +1,6 @@
 # Napari droplets detector
 
-A napari plugin for detecting and analyzing water-in-oil droplets with parameter adjustment.
+A `napari` plugin for detecting and analyzing water-in-oil droplets with parameter adjustment.
 
 ## Installation
 
@@ -12,9 +12,9 @@ pip install -e napari-droplets-detector
 
 ## Usage
 
-1. Launch napari and load your images
+1. Launch `napari` and load your images
 2. Activate: `Plugins > Droplets Detector`
-3. Select an image layer from the dropdown
+3. Select an image layer from the drop-down menu
 4. Adjust parameters and click "Process Image"
 5. Use widgets to export and analyze detected droplets
 
@@ -30,7 +30,8 @@ conversion_factor # Factor to convert pixels to micrometers
 
 ## Features
 
-- Droplet detection with adjustable thresholds
+- Droplet detection with adjustable parameters
+- Custom palette import for visually beautiful droplets
 - CSV export with comprehensive measurements
 - Statistical analysis and visualization export
 
