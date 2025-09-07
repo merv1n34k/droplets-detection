@@ -1,9 +1,13 @@
 # Droplets detection
 
+Note: currently it is partially implemented inclusions detection, but the
+algorithm is inaccurate, use `detect.py` for advanced droplets/inclusions
+detection.
+
 This is a collection of python scripts and a napari plugin for detecting droplets from microscopy images.
 
 ## How to use
-The repo contains automated pipelines (see `scripts` directory) and napari plugin for playing with droplet-detection parameters. See `README` in plugin directory for more details. Use the latest script version *(v4)*, other versions are legacy scripts, example:
+The repo contains automated pipelines (see `scripts` directory), napari plugin for playing with droplet-detection parameter, and new script for visualizing each image processing step. See `README` in plugin directory for more details. Use the latest script version *(v4)*, other versions are legacy scripts, example:
 
 ```bash
 
